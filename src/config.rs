@@ -157,3 +157,55 @@ pub fn ensure_dotdir_gitignore(dotdir_path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hippocampus-config-test-{nanos}"));
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        dir
+    }
+
+    #[test]
+    fn discover_dotdirs_includes_non_dot_name_when_config_exists() {
+        let root = make_temp_dir();
+        let managed = root.join("plan");
+        fs::create_dir_all(&managed).expect("failed to create managed dir");
+        fs::write(managed.join(CONFIG_FILE), "repo = \"../repo\"\n")
+            .expect("failed to write config");
+
+        let found = discover_dotdirs(&root).expect("discover_dotdirs should run");
+
+        assert!(
+            found.iter().any(|d| d == "plan"),
+            "expected 'plan' to be discovered, got: {found:?}"
+        );
+
+        fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
+    }
+
+    #[test]
+    fn discover_dotdirs_finds_configured_directory_in_deep_path() {
+        let root = make_temp_dir();
+        let managed = root.join("very").join("deep").join("plan");
+        fs::create_dir_all(&managed).expect("failed to create deep managed dir");
+        fs::write(managed.join(CONFIG_FILE), "repo = \"../repo\"\n")
+            .expect("failed to write config");
+
+        let found = discover_dotdirs(&root).expect("discover_dotdirs should run");
+
+        assert!(
+            found.iter().any(|d| d == "very/deep/plan"),
+            "expected deep managed dir to be discovered, got: {found:?}"
+        );
+
+        fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
+    }
+}
