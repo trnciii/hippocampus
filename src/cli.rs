@@ -23,6 +23,9 @@ enum Commands {
         /// Path to the repo-side project root
         #[arg(short, long)]
         repo: String,
+        /// Project-side root directory (default: auto-detect via .git)
+        #[arg(long, default_value = "")]
+        root: String,
     },
     /// Commit and push changes to the repo
     Push {
@@ -58,7 +61,7 @@ impl Cli {
 
     pub fn run(self) -> Result<()> {
         match self.command {
-            Commands::Init { dotdir, repo } => cmd_init(dotdir, &repo),
+            Commands::Init { dotdir, repo, root } => cmd_init(dotdir, &repo, &root),
             Commands::Push { message } => cmd_push(message),
             Commands::Pull => cmd_pull(),
             Commands::Sync { message } => cmd_sync(message),
@@ -70,8 +73,9 @@ impl Cli {
     }
 }
 
-fn project_root() -> Result<PathBuf> {
+fn scan_root() -> Result<PathBuf> {
     config::find_project_root()
+        .context("Could not find project root (.git).")
 }
 
 fn project_name() -> String {
@@ -82,11 +86,11 @@ fn project_name() -> String {
 }
 
 /// Load configs for all managed dotdirs, return (dotdir_name, config) pairs
-fn load_all_dotdir_configs(project_root: &Path) -> Result<Vec<(String, DotdirConfig)>> {
-    let dotdirs = config::discover_dotdirs(project_root)?;
+fn load_all_dotdir_configs(scan_root: &Path) -> Result<Vec<(String, DotdirConfig)>> {
+    let dotdirs = config::discover_dotdirs(scan_root)?;
     let mut configs = Vec::new();
     for dd in dotdirs {
-        let cfg = DotdirConfig::load(project_root, &dd)?;
+        let cfg = DotdirConfig::load(scan_root, &dd)?;
         configs.push((dd, cfg));
     }
     Ok(configs)
@@ -95,12 +99,8 @@ fn load_all_dotdir_configs(project_root: &Path) -> Result<Vec<(String, DotdirCon
 /// Get the VCS repo root and backend from a dotdir config.
 /// Uses filesystem walk only — no git subprocess — so the root is always
 /// a native path usable as Command::current_dir on Windows.
-fn repo_root_from_config(project_root: &Path, cfg: &DotdirConfig) -> Result<(PathBuf, Box<dyn vcs::Vcs>)> {
-    let repo_path = if Path::new(&cfg.repo).is_relative() {
-        project_root.join(&cfg.repo)
-    } else {
-        PathBuf::from(&cfg.repo)
-    };
+fn repo_root_from_config(cfg: &DotdirConfig) -> Result<(PathBuf, Box<dyn vcs::Vcs>)> {
+    let repo_path = cfg.repo_project_path();
     if !repo_path.exists() {
         anyhow::bail!("Repo side: path does not exist: {}\nCheck the 'repo' value in .hippocampus.toml", repo_path.display());
     }
@@ -111,7 +111,7 @@ fn repo_root_from_config(project_root: &Path, cfg: &DotdirConfig) -> Result<(Pat
 /// Returns the subdirectory name of a project within the plans repo.
 /// e.g. cfg.repo = "../plans/hippocampus" → PathBuf::from("hippocampus")
 fn repo_subdir(cfg: &DotdirConfig) -> Result<PathBuf> {
-    Path::new(&cfg.repo)
+    cfg.repo_project_path()
         .file_name()
         .map(PathBuf::from)
         .context("repo path has no file name component")
@@ -164,9 +164,15 @@ fn sync_all_links(root: &Path, configs: &[(String, DotdirConfig)]) -> Result<()>
     Ok(())
 }
 
-fn cmd_init(dotdir: Option<String>, repo: &str) -> Result<()> {
-    let root = project_root()?;
+fn cmd_init(dotdir: Option<String>, repo: &str, root_arg: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = if root_arg.is_empty() {
+        config::find_project_root()
+            .context("Could not find project root (.git). Use --root to specify explicitly.")?
+    } else {
+        let p = Path::new(root_arg);
+        if p.is_relative() { cwd.join(p) } else { p.to_path_buf() }
+    };
 
     let repo_abs = if Path::new(repo).is_relative() {
         cwd.join(repo)
@@ -200,8 +206,15 @@ fn cmd_init(dotdir: Option<String>, repo: &str) -> Result<()> {
         // .gitignore in dotdir
         config::ensure_dotdir_gitignore(&dotdir_path)?;
 
-        // Per-dotdir .hippocampus.toml
-        config::create_dotdir_config(&dotdir_path, repo)?;
+        // Per-dotdir .hippocampus.toml (repo path is relative to config file location)
+        let repo_for_config = if Path::new(repo).is_relative() {
+            pathdiff::diff_paths(&repo_abs, &dotdir_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repo_abs.to_string_lossy().into_owned())
+        } else {
+            repo.to_string()
+        };
+        config::create_dotdir_config(&dotdir_path, &repo_for_config)?;
 
         // Absorb existing real files to repo
         let absorbed = linker::absorb_files(&dotdir_path, &repo_dotdir, None)?;
@@ -246,7 +259,7 @@ fn cmd_init(dotdir: Option<String>, repo: &str) -> Result<()> {
 }
 
 fn cmd_push(message: Option<String>) -> Result<()> {
-    let root = project_root()?;
+    let root = scan_root()?;
     let configs = load_all_dotdir_configs(&root)?;
 
     if configs.is_empty() {
@@ -262,7 +275,7 @@ fn cmd_push(message: Option<String>) -> Result<()> {
 
     // VCS operations
     let first_cfg = &configs[0].1;
-    let (repo_root, vcs_backend) = repo_root_from_config(&root, first_cfg)?;
+    let (repo_root, vcs_backend) = repo_root_from_config(first_cfg)?;
     let subdir = repo_subdir(first_cfg)?;
 
     if !vcs_backend.has_changes(&repo_root, &subdir)? {
@@ -286,7 +299,7 @@ fn cmd_push(message: Option<String>) -> Result<()> {
 }
 
 fn cmd_pull() -> Result<()> {
-    let root = project_root()?;
+    let root = scan_root()?;
     let configs = load_all_dotdir_configs(&root)?;
 
     if configs.is_empty() {
@@ -294,7 +307,7 @@ fn cmd_pull() -> Result<()> {
     }
 
     let first_cfg = &configs[0].1;
-    let (repo_root, vcs_backend) = repo_root_from_config(&root, first_cfg)?;
+    let (repo_root, vcs_backend) = repo_root_from_config(first_cfg)?;
 
     vcs_backend.pull(&repo_root)?;
     println!("Pulled.");
@@ -306,7 +319,7 @@ fn cmd_pull() -> Result<()> {
 }
 
 fn cmd_sync(message: Option<String>) -> Result<()> {
-    let root = project_root()?;
+    let root = scan_root()?;
     let configs = load_all_dotdir_configs(&root)?;
 
     if configs.is_empty() {
@@ -314,7 +327,7 @@ fn cmd_sync(message: Option<String>) -> Result<()> {
     }
 
     let first_cfg = &configs[0].1;
-    let (repo_root, vcs_backend) = repo_root_from_config(&root, first_cfg)?;
+    let (repo_root, vcs_backend) = repo_root_from_config(first_cfg)?;
     let subdir = repo_subdir(first_cfg)?;
 
     // Local changes first: prune deletions, absorb real files
@@ -350,7 +363,7 @@ fn cmd_sync(message: Option<String>) -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
-    let root = project_root()?;
+    let root = scan_root()?;
     let configs = load_all_dotdir_configs(&root)?;
 
     if configs.is_empty() {
@@ -358,7 +371,7 @@ fn cmd_status() -> Result<()> {
     }
 
     let first_cfg = &configs[0].1;
-    let (repo_root, vcs_backend) = repo_root_from_config(&root, first_cfg)?;
+    let (repo_root, vcs_backend) = repo_root_from_config(first_cfg)?;
 
     let status = vcs_backend.status(&repo_root)?;
     if status.is_empty() {
@@ -370,7 +383,7 @@ fn cmd_status() -> Result<()> {
 }
 
 fn cmd_diff() -> Result<()> {
-    let root = project_root()?;
+    let root = scan_root()?;
     let configs = load_all_dotdir_configs(&root)?;
 
     if configs.is_empty() {
@@ -378,7 +391,7 @@ fn cmd_diff() -> Result<()> {
     }
 
     let first_cfg = &configs[0].1;
-    let (repo_root, vcs_backend) = repo_root_from_config(&root, first_cfg)?;
+    let (repo_root, vcs_backend) = repo_root_from_config(first_cfg)?;
 
     let diff = vcs_backend.diff(&repo_root)?;
     if diff.is_empty() {
@@ -390,67 +403,22 @@ fn cmd_diff() -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let root = project_root()?;
+    let root = scan_root()?;
     let configs = load_all_dotdir_configs(&root)?;
 
     if configs.is_empty() {
         bail!("No managed dotdirs found. Run 'tt init' first.");
     }
 
-    // repo points to the project dir in the plans repo; parent is the plans repo root
-    let first_cfg = &configs[0].1;
-    let repo_project = if Path::new(&first_cfg.repo).is_relative() {
-        root.join(&first_cfg.repo)
-    } else {
-        PathBuf::from(&first_cfg.repo)
-    };
-
-    let repo_base = match repo_project.parent() {
-        Some(p) => p.to_path_buf(),
-        None => {
-            println!("Cannot determine repo root from: {}", repo_project.display());
-            return Ok(());
-        }
-    };
-
-    if !repo_base.exists() {
-        println!("Repo not found: {}", repo_base.display());
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(&repo_base)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let project_dir = repo_base.join(&name);
-        let mut dotdirs = Vec::new();
-        for sub in fs::read_dir(&project_dir)? {
-            let sub = sub?;
-            let sub_name = sub.file_name().to_string_lossy().into_owned();
-            if sub_name.starts_with('.') && sub.file_type()?.is_dir() {
-                dotdirs.push(sub_name);
-            }
-        }
-        dotdirs.sort();
-        if dotdirs.is_empty() {
-            println!("{}/", name);
-        } else {
-            for dd in &dotdirs {
-                println!("{}/{}", name, dd);
-            }
-        }
+    for (dd, cfg) in &configs {
+        println!("{} -> {}", dd, cfg.repo_dotdir_path(&root, dd).display());
     }
 
     Ok(())
 }
 
 fn cmd_unlink(dotdir: Option<String>) -> Result<()> {
-    let root = project_root()?;
+    let root = scan_root()?;
 
     let dotdirs = match dotdir {
         Some(d) => vec![d],
@@ -495,4 +463,137 @@ fn cmd_unlink(dotdir: Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn make_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hippocampus-cli-test-{nanos}"));
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        dir
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn scoped_discovery_includes_non_dot_and_deep_dirs_under_current_dir() {
+        let root = make_temp_dir();
+        let scope = root.join("scope");
+        let managed = scope.join("src").join("plans");
+        let ignored = root.join("outside").join("plans");
+
+        fs::create_dir_all(&managed).expect("failed to create managed dir");
+        fs::create_dir_all(&ignored).expect("failed to create ignored dir");
+
+        fs::write(managed.join(".hippocampus.toml"), "repo = \"../repo\"\n")
+            .expect("failed to write managed config");
+        fs::write(ignored.join(".hippocampus.toml"), "repo = \"../repo\"\n")
+            .expect("failed to write ignored config");
+
+        let configs = load_all_dotdir_configs(&scope).expect("failed to load configs");
+        let names: Vec<_> = configs.iter().map(|(name, _)| name.clone()).collect();
+
+        assert!(
+            names.iter().any(|name| name == &Path::new("src").join("plans").to_string_lossy()),
+            "expected src/plans under current scope, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("outside")),
+            "should not include directories outside current scope: {names:?}"
+        );
+
+        fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
+    }
+
+    #[test]
+    fn deep_directory_workflow_supports_all_commands() {
+        let _guard = CWD_LOCK.lock().expect("failed to lock cwd");
+
+        let git_available = Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_available {
+            eprintln!("git not available; skipping test");
+            return;
+        }
+
+        let original_cwd = std::env::current_dir().expect("failed to get current dir");
+        let root = make_temp_dir();
+
+        let remote = root.join("remote.git");
+        let plans = root.join("plans");
+        let project = root.join("project");
+
+        let remote_str = remote.to_string_lossy().into_owned();
+        run_git(&root, &["init", "--bare", &remote_str]);
+        run_git(&root, &["clone", &remote_str, "plans"]);
+
+        run_git(&plans, &["config", "user.name", "Test User"]);
+        run_git(&plans, &["config", "user.email", "test@example.com"]);
+        fs::write(plans.join("README.md"), "seed\n").expect("failed to write seed file");
+        run_git(&plans, &["add", "."]);
+        run_git(&plans, &["commit", "-m", "seed"]);
+        run_git(&plans, &["push", "-u", "origin", "HEAD"]);
+
+        fs::create_dir_all(&project).expect("failed to create project dir");
+        run_git(&project, &["init"]);
+        run_git(&project, &["config", "user.name", "Test User"]);
+        run_git(&project, &["config", "user.email", "test@example.com"]);
+
+        let deep = project.join("very").join("deep").join("cwd");
+        fs::create_dir_all(&deep).expect("failed to create deep cwd");
+
+        let repo_project = plans.join("hippocampus");
+        let repo_rel = pathdiff::diff_paths(&repo_project, &deep)
+            .expect("failed to compute relative repo path")
+            .to_string_lossy()
+            .into_owned();
+
+        std::env::set_current_dir(&deep).expect("failed to set deep cwd");
+
+        cmd_init(Some(".plan".to_string()), &repo_rel, &project.to_string_lossy()).expect("init should succeed");
+        cmd_status().expect("status should succeed");
+        cmd_diff().expect("diff should succeed");
+        cmd_push(None).expect("push should succeed");
+        cmd_pull().expect("pull should succeed");
+        cmd_sync(None).expect("sync should succeed");
+        cmd_list().expect("list should succeed");
+        cmd_unlink(Some(".plan".to_string())).expect("unlink should succeed");
+
+        let config_path = project.join(".plan").join(".hippocampus.toml");
+        assert!(
+            !config_path.exists(),
+            "unlink should remove config file: {}",
+            config_path.display()
+        );
+
+        std::env::set_current_dir(&original_cwd).expect("failed to restore cwd");
+        fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
+    }
 }

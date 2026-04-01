@@ -7,10 +7,41 @@ use std::path::{Path, PathBuf};
 const CONFIG_FILE: &str = ".hippocampus.toml";
 const DOTDIR_GITIGNORE: &str = "*\n";
 
+/// Resolve `.` and `..` components in a path without requiring it to exist.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut parts: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let last = parts.last();
+                if matches!(last, Some(Component::Normal(_))) {
+                    parts.pop();
+                } else {
+                    parts.push(component);
+                }
+            }
+            c => parts.push(c),
+        }
+    }
+    parts.iter().collect()
+}
+
+fn escape_toml_basic_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Per-dotdir config stored in <dotdir>/.hippocampus.toml
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct DotdirConfig {
     pub repo: String,
+    config_dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDotdirConfig {
+    repo: String,
 }
 
 /// Optional project-root config for defaults
@@ -48,9 +79,12 @@ impl DotdirConfig {
         if dotdir_config_path.exists() {
             let content = fs::read_to_string(&dotdir_config_path)
                 .with_context(|| format!("Failed to read {}", dotdir_config_path.display()))?;
-            let cfg: DotdirConfig = toml::from_str(&content)
+            let raw: RawDotdirConfig = toml::from_str(&content)
                 .with_context(|| format!("Failed to parse {}", dotdir_config_path.display()))?;
-            return Ok(cfg);
+            return Ok(DotdirConfig {
+                repo: raw.repo,
+                config_dir: project_root.join(dotdir),
+            });
         }
 
         // Fall back to project-root config
@@ -69,14 +103,20 @@ impl DotdirConfig {
                         .map(String::from)
                         .or(raw.repo.clone());
                     if let Some(repo) = repo {
-                        return Ok(DotdirConfig { repo });
+                        return Ok(DotdirConfig {
+                            repo,
+                            config_dir: project_root.to_path_buf(),
+                        });
                     }
                 }
             }
 
             // Use top-level defaults
             if let Some(repo) = raw.repo {
-                return Ok(DotdirConfig { repo });
+                return Ok(DotdirConfig {
+                    repo,
+                    config_dir: project_root.to_path_buf(),
+                });
             }
         }
 
@@ -87,18 +127,50 @@ impl DotdirConfig {
         );
     }
 
-    /// Resolve the repo-side path for this dotdir: repo / dotdir
-    pub fn repo_dotdir_path(&self, project_root: &Path, dotdir: &str) -> PathBuf {
-        let repo_abs = if Path::new(&self.repo).is_relative() {
-            project_root.join(&self.repo)
+    /// Resolve the repo project path stored in this config.
+    /// Relative values are interpreted from the config file location.
+    /// The returned path has `.` and `..` components resolved.
+    pub fn repo_project_path(&self) -> PathBuf {
+        let raw = if Path::new(&self.repo).is_relative() {
+            self.config_dir.join(&self.repo)
         } else {
             PathBuf::from(&self.repo)
         };
+        normalize_path(&raw)
+    }
+
+    /// Resolve the repo-side path for this dotdir: repo / dotdir
+    pub fn repo_dotdir_path(&self, _project_root: &Path, dotdir: &str) -> PathBuf {
+        let repo_abs = self.repo_project_path();
         repo_abs.join(dotdir)
     }
 }
 
-/// Discover managed dotdirs by scanning project_root for dot-directories containing .hippocampus.toml
+fn collect_managed_dotdirs(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("Failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        if entry_path.join(CONFIG_FILE).exists() {
+            let relative = entry_path
+                .strip_prefix(root)
+                .with_context(|| format!("Failed to relativize {}", entry_path.display()))?
+                .to_string_lossy()
+                .into_owned();
+            out.push(relative);
+            continue;
+        }
+
+        collect_managed_dotdirs(root, &entry_path, out)?;
+    }
+    Ok(())
+}
+
+/// Discover managed dotdirs by scanning project_root recursively for directories containing .hippocampus.toml
 pub fn discover_dotdirs(project_root: &Path) -> Result<Vec<String>> {
     let mut dotdirs = Vec::new();
 
@@ -106,17 +178,7 @@ pub fn discover_dotdirs(project_root: &Path) -> Result<Vec<String>> {
         return Ok(dotdirs);
     }
 
-    for entry in fs::read_dir(project_root)
-        .with_context(|| format!("Failed to read {}", project_root.display()))?
-    {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && entry.file_type()?.is_dir() {
-            if entry.path().join(CONFIG_FILE).exists() {
-                dotdirs.push(name);
-            }
-        }
-    }
+    collect_managed_dotdirs(project_root, project_root, &mut dotdirs)?;
 
     dotdirs.sort();
     Ok(dotdirs)
@@ -133,7 +195,10 @@ pub fn discover_repo_dotdirs(repo_path: &Path) -> Result<Vec<String>> {
     {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && entry.file_type()?.is_dir() {
+        if name == ".git" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
             dotdirs.push(name);
         }
     }
@@ -144,7 +209,7 @@ pub fn discover_repo_dotdirs(repo_path: &Path) -> Result<Vec<String>> {
 /// Write per-dotdir .hippocampus.toml
 pub fn create_dotdir_config(dotdir_path: &Path, repo: &str) -> Result<()> {
     let config_path = dotdir_path.join(CONFIG_FILE);
-    let content = format!("repo = \"{repo}\"\n");
+    let content = format!("repo = \"{}\"\n", escape_toml_basic_string(repo));
     fs::write(&config_path, &content)
         .with_context(|| format!("Failed to write {}", config_path.display()))?;
     Ok(())
@@ -200,11 +265,78 @@ mod tests {
             .expect("failed to write config");
 
         let found = discover_dotdirs(&root).expect("discover_dotdirs should run");
+        let expected = Path::new("very")
+            .join("deep")
+            .join("plan")
+            .to_string_lossy()
+            .into_owned();
 
         assert!(
-            found.iter().any(|d| d == "very/deep/plan"),
+            found.iter().any(|d| d == &expected),
             "expected deep managed dir to be discovered, got: {found:?}"
         );
+
+        fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
+    }
+
+    #[test]
+    fn repo_path_is_resolved_relative_to_dotdir_config_file() {
+        let root = make_temp_dir();
+        let dotdir = ".plan";
+        let dotdir_path = root.join(dotdir);
+        let repo_root = root.join("..repo");
+
+        fs::create_dir_all(&dotdir_path).expect("failed to create dotdir");
+        fs::create_dir_all(repo_root.join(dotdir)).expect("failed to create repo dotdir");
+
+        fs::write(dotdir_path.join(CONFIG_FILE), "repo = \"../..repo\"\n")
+            .expect("failed to write config");
+
+        let cfg = DotdirConfig::load(&root, dotdir).expect("failed to load dotdir config");
+        let resolved = cfg.repo_dotdir_path(&root, dotdir);
+
+        let resolved_norm = fs::canonicalize(&resolved).expect("failed to canonicalize resolved path");
+        let expected_norm =
+            fs::canonicalize(repo_root.join(dotdir)).expect("failed to canonicalize expected path");
+        assert_eq!(resolved_norm, expected_norm);
+
+        fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
+    }
+
+    #[test]
+    fn repo_project_path_is_resolved_relative_to_dotdir_config_file() {
+        let root = make_temp_dir();
+        let dotdir = ".plan";
+        let dotdir_path = root.join(dotdir);
+        let repo_root = root.join("..repo");
+
+        fs::create_dir_all(&dotdir_path).expect("failed to create dotdir");
+        fs::create_dir_all(&repo_root).expect("failed to create repo root");
+        fs::write(dotdir_path.join(CONFIG_FILE), "repo = \"../..repo\"\n")
+            .expect("failed to write config");
+
+        let cfg = DotdirConfig::load(&root, dotdir).expect("failed to load dotdir config");
+        let resolved_norm = fs::canonicalize(cfg.repo_project_path())
+            .expect("failed to canonicalize resolved repo path");
+        let expected_norm = fs::canonicalize(&repo_root)
+            .expect("failed to canonicalize expected repo path");
+
+        assert_eq!(resolved_norm, expected_norm);
+
+        fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
+    }
+
+    #[test]
+    fn create_dotdir_config_escapes_backslashes_for_toml() {
+        let root = make_temp_dir();
+        let dotdir = root.join(".plan");
+        fs::create_dir_all(&dotdir).expect("failed to create dotdir");
+
+        create_dotdir_config(&dotdir, r"..\very\deep\repo").expect("failed to write config");
+        let content = fs::read_to_string(dotdir.join(CONFIG_FILE)).expect("failed to read config");
+
+        let parsed: RawDotdirConfig = toml::from_str(&content).expect("config should be valid toml");
+        assert_eq!(parsed.repo, r"..\very\deep\repo");
 
         fs::remove_dir_all(&root).expect("failed to cleanup temp dir");
     }
