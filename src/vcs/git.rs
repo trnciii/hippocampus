@@ -44,6 +44,11 @@ impl Vcs for Git {
         Ok(())
     }
 
+    fn fetch(&self, repo_path: &Path) -> Result<()> {
+        Git::run(&["fetch"], repo_path)?;
+        Ok(())
+    }
+
     fn status(&self, repo_path: &Path) -> Result<String> {
         Git::run(&["status", "--short"], repo_path)
     }

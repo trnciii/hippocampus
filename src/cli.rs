@@ -373,6 +373,8 @@ fn cmd_status() -> Result<()> {
     let first_cfg = &configs[0].1;
     let (repo_root, vcs_backend) = repo_root_from_config(first_cfg)?;
 
+    vcs_backend.fetch(&repo_root)?;
+
     let status = vcs_backend.status(&repo_root)?;
     if status.is_empty() {
         println!("Clean.");
@@ -402,6 +404,44 @@ fn cmd_diff() -> Result<()> {
     Ok(())
 }
 
+fn ansi_dim(s: &str) -> String {
+    format!("\x1b[2m{}\x1b[0m", s)
+}
+
+fn ansi_red(s: &str) -> String {
+    format!("\x1b[31m{}\x1b[0m", s)
+}
+
+/// Format the repo-side dotdir path with ANSI coloring.
+/// Normal: repo_project portion plain, dotdir suffix dim.
+/// Missing: deepest existing prefix plain, rest red.
+fn format_repo_path_colored(repo_project: &Path, dotdir: &str) -> String {
+    use std::path::MAIN_SEPARATOR;
+    let full = repo_project.join(dotdir);
+    if full.exists() {
+        format!("{}{MAIN_SEPARATOR}{}", repo_project.display(), ansi_dim(dotdir))
+    } else {
+        // Walk components to find deepest existing ancestor.
+        let mut existing = PathBuf::new();
+        for comp in full.components() {
+            let candidate = existing.join(comp);
+            if candidate.exists() {
+                existing = candidate;
+            } else {
+                break;
+            }
+        }
+        let full_str = full.to_string_lossy().into_owned();
+        let existing_str = existing.to_string_lossy().into_owned();
+        if existing_str.is_empty() {
+            ansi_red(&full_str)
+        } else {
+            let rest = &full_str[existing_str.len()..];
+            format!("{}{}", existing_str, ansi_red(rest))
+        }
+    }
+}
+
 fn cmd_list() -> Result<()> {
     let root = scan_root()?;
     let configs = load_all_dotdir_configs(&root)?;
@@ -411,7 +451,9 @@ fn cmd_list() -> Result<()> {
     }
 
     for (dd, cfg) in &configs {
-        println!("{} -> {}", dd, cfg.repo_dotdir_path(&root, dd).display());
+        let repo_project = cfg.repo_project_path();
+        println!("{}", dd);
+        println!("  ->  {}", format_repo_path_colored(&repo_project, dd));
     }
 
     Ok(())

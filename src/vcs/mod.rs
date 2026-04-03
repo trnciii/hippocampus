@@ -8,6 +8,7 @@ pub trait Vcs {
     fn commit(&self, repo_root: &Path, message: &str) -> Result<()>;
     fn push(&self, repo_root: &Path) -> Result<()>;
     fn pull(&self, repo_root: &Path) -> Result<()>;
+    fn fetch(&self, repo_root: &Path) -> Result<()>;
     fn status(&self, repo_root: &Path) -> Result<String>;
     fn diff(&self, repo_root: &Path) -> Result<String>;
     fn has_changes(&self, repo_root: &Path, path: &Path) -> Result<bool>;
